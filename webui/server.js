@@ -21,13 +21,15 @@
  *   ACCOUNTS_LOCK_MINUTES 锁定时长（默认 5 分钟）
  *   WEBUI_API_PORT    登录用 API 服务端口（默认 3010）
  *   CHECKIN_API_PORT  签到子进程 API 服务端口（默认 3020）
- *   WEBUI_PHONE_SEND_IP_LIMIT    发送验证码的 IP 限流，格式 "次数/分钟"（默认 "3/60"，即每 IP 每小时 3 次）
+ *   WEBUI_PHONE_SEND_GLOBAL_LIMIT  发送验证码的全局限流，格式 "次数/分钟"（默认 "20/60"，即全服务每小时 20 次）
  *   WEBUI_PHONE_SEND_PHONE_LIMIT 发送验证码的手机号限流，格式 "次数/分钟"（默认 "2/1440"，即每号 24 小时 2 次）
  *   WEBUI_QR_GEN_IP_LIMIT        生成登录二维码的 IP 限流，格式 "次数/分钟"（默认 "1/3"，即每 IP 3 分钟 1 次）
- *   WEBUI_EMAIL_SEND_IP_LIMIT    发送邮箱验证码的 IP 限流，格式 "次数/分钟"（默认 "5/60"）
  *   WEBUI_EMAIL_SEND_USER_LIMIT  发送邮箱验证码的单账号限流，格式 "次数/分钟"（默认 "3/60"）
- *                     以上各项限流均对「内网/本机」来源豁免；反向代理部署必须正确设置 WEBUI_TRUST_PROXY，
- *                     否则公网请求会被视为来自代理内网地址而全部豁免，限流形同虚设。
+ *                     除二维码生成外，各项限流均按账号/手机号/全局计数，不依赖来源 IP——
+ *                     容器端口映射下 req.ip 恒为网桥地址，反向代理下又取自可伪造的
+ *                     X-Forwarded-For，按 IP 计数在两种部署下都没有意义。二维码生成仍按 IP
+ *                     并对「内网/本机」豁免，此时反向代理部署必须正确设置 WEBUI_TRUST_PROXY，
+ *                     否则公网请求会被视为来自代理内网地址而全部豁免。
  *   MAIL_FROM_NAME    邮件发件人显示名（默认「酷狗签到助手」）
  *   MAIL_INVALID_NOTIFY  是否在账号登录凭据失效时给该账号绑定的邮箱发提醒（默认开启，设 false 关闭）
  *   MAIL_NOTICE_COOLDOWN_DAYS 同一账号的失效提醒最小间隔天数（默认 7）
@@ -139,50 +141,14 @@ const RUN_ON_STARTUP = envFlag('RUN_ON_STARTUP')
 const IDLE_SHUTDOWN_MS = 10 * 60 * 1000
 
 // ── 手动「立即签到」限流 ──
-// 防止公网用户反复触发签到（每次都会拉起 API 子进程并请求酷狗接口）。
-// 默认同一 IP 12 小时内仅可触发一次；设为 0 可完全关闭。
-// 内网 / 本机来源豁免（见 isPrivateIp），不影响本机运维与反向代理转发。
-const CHECKIN_MANUAL_COOLDOWN_HOURS = (() => {
-  const raw = String(process.env.CHECKIN_MANUAL_COOLDOWN_HOURS ?? '').trim()
-  if (raw === '') return 12                 // 默认 12 小时
-  const n = parseFloat(raw)
-  return Number.isFinite(n) && n >= 0 ? n : 12
-})()
-const CHECKIN_MANUAL_COOLDOWN_MS = CHECKIN_MANUAL_COOLDOWN_HOURS * 60 * 60 * 1000
-// ip -> 上次成功触发的时间戳（毫秒）。仅保留未过期的桶，避免无限增长。
-const manualCheckinLastAt = new Map()
-const MANUAL_CHECKIN_MAP_MAX = 5000
-
-/**
- * 查询某 IP 的手动签到冷却状态。
- * @param {string} ip
- * @returns {{ blocked: boolean, remainingMs: number, lastAt: number }}
- */
-function manualCheckinCooldown(ip) {
-  if (CHECKIN_MANUAL_COOLDOWN_MS <= 0) return { blocked: false, remainingMs: 0, lastAt: 0 }
-  const key = normalizeIp(ip)
-  const lastAt = manualCheckinLastAt.get(key) || 0
-  const elapsed = Date.now() - lastAt
-  const remainingMs = lastAt ? Math.max(0, CHECKIN_MANUAL_COOLDOWN_MS - elapsed) : 0
-  return { blocked: remainingMs > 0, remainingMs, lastAt }
-}
-
-/** 记录某 IP 的一次成功触发，并顺带清理过期桶。 */
-function markManualCheckin(ip) {
-  if (CHECKIN_MANUAL_COOLDOWN_MS <= 0) return
-  const now = Date.now()
-  const key = normalizeIp(ip)
-  manualCheckinLastAt.set(key, now)
-  if (manualCheckinLastAt.size > MANUAL_CHECKIN_MAP_MAX) {
-    for (const [k, v] of manualCheckinLastAt) {
-      if (now - v >= CHECKIN_MANUAL_COOLDOWN_MS) manualCheckinLastAt.delete(k)
-    }
-  }
-}
+// 防止反复触发签到（每次都会拉起 API 子进程并请求酷狗接口）。
+// 只按账号维度计数（见下面的 CHECKIN_PER_USERID_DAILY），不按来源 IP：
+// 端口映射部署下 req.ip 恒为网桥地址，开 trust proxy 后又取自可伪造的
+// X-Forwarded-For，两种情况下按 IP 计数都不可靠。
 
 // ── 单账号签到的每日配额 ──
 // 按 userid 计数（不分 IP）：每天最多 CHECKIN_PER_USERID_DAILY 次。
-// 与上面的 IP 冷却相互独立，两者都作用于「单账号签到」；
+// 这是「单账号签到」唯一的限流维度；
 // admin 验证后的「全部账号签到」不占用该配额。
 const CHECKIN_PER_USERID_DAILY = (() => {
   const raw = String(process.env.CHECKIN_PER_USERID_DAILY ?? '').trim()
@@ -228,20 +194,10 @@ function markPerUseridUsed(userid) {
   }
 }
 
-/** 把剩余毫秒格式化为「X 小时 Y 分钟」（中文提示用）。 */
-function formatRemaining(ms) {
-  const totalMin = Math.max(1, Math.ceil(ms / 60000))
-  const h = Math.floor(totalMin / 60)
-  const m = totalMin % 60
-  if (h > 0 && m > 0) return `${h} 小时 ${m} 分钟`
-  if (h > 0) return `${h} 小时`
-  return `${m} 分钟`
-}
-
 // ── 通用滑动窗口限流 ──
 // 保护会向酷狗发起真实请求、且可被公网匿名调用的接口（发送验证码 / 生成登录二维码）。
 // 采用时间戳数组的滑动窗口：窗口内计数达到上限即拒绝，并返回剩余等待时间。
-// 与上面的手动签到限流一致，内网/本机来源豁免（公网部署需正确设置 WEBUI_TRUST_PROXY）。
+// 按账号/手机号计数的桶不依赖来源 IP；仅二维码生成仍按 IP，且内网/本机豁免。
 
 /**
  * 解析 "次数/分钟" 形式的限流配置，为空或非法时回落默认值。
@@ -262,12 +218,15 @@ function parseRateSpec(raw, defCount, defMinutes) {
   return { count, windowMs: minutes * 60 * 1000 }
 }
 
-const PHONE_SEND_IP_LIMIT = parseRateSpec(process.env.WEBUI_PHONE_SEND_IP_LIMIT, 3, 60)
+// 以下限流除二维码生成外均不依赖来源 IP：容器端口映射下 req.ip 恒为网桥地址
+// （如 172.17.0.1），开 trust proxy 后又取自可伪造的 X-Forwarded-For，
+// 按 IP 计数在两种部署下都无法代表真实调用方。
+const PHONE_SEND_GLOBAL_LIMIT = parseRateSpec(process.env.WEBUI_PHONE_SEND_GLOBAL_LIMIT, 20, 60)
 const PHONE_SEND_PHONE_LIMIT = parseRateSpec(process.env.WEBUI_PHONE_SEND_PHONE_LIMIT, 2, 24 * 60)
 const QR_GEN_IP_LIMIT = parseRateSpec(process.env.WEBUI_QR_GEN_IP_LIMIT, 1, 3)
-// 邮箱验证码会真实发出邮件：既按 IP 限制（防单机刷量），也按目标账号限制
-// （防止针对某个账号反复触发，把别人的收件箱当靶子）。
-const EMAIL_SEND_IP_LIMIT = parseRateSpec(process.env.WEBUI_EMAIL_SEND_IP_LIMIT, 5, 60)
+// 邮箱验证码会真实发出邮件：按目标账号限制，防止针对某个账号反复触发、
+// 把别人的收件箱当靶子。该接口已由 accountsGuard 认证为本人（或 admin），
+// 调用方身份明确，无需再叠加不可靠的 IP 维度。
 const EMAIL_SEND_USER_LIMIT = parseRateSpec(process.env.WEBUI_EMAIL_SEND_USER_LIMIT, 3, 60)
 
 // key -> 窗口内命中时间戳数组（递增）。桶数超过 RATE_MAP_MAX 时清理过期桶，避免内存无限增长。
@@ -294,7 +253,7 @@ function rateBucket(key, windowMs) {
 
 /**
  * 检查并记录一次访问。
- * @param {string} key 桶标识（含维度前缀，如 `sms:ip:1.2.3.4`）
+ * @param {string} key 桶标识（含维度前缀，如 `sms:phone:13800138000`、`qr:1.2.3.4`）
  * @param {{ count: number, windowMs: number }} spec
  * @returns {{ allowed: boolean, retryAfterMs: number }}
  */
@@ -664,12 +623,6 @@ app.use(express.static(path.join(__dirname, 'public')))
 /** 请求来源 IP（统一入口，便于后续调整代理策略） */
 function clientIp(req) {
   return req.ip || req.socket?.remoteAddress || 'unknown'
-}
-
-/** 是否为回环地址来源（本机引导流程用） */
-function isLoopback(req) {
-  const ip = clientIp(req)
-  return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1'
 }
 
 /**
@@ -1290,12 +1243,14 @@ function describeUpstreamError(r) {
 app.post('/api/phone/send', wrap(async (req, res) => {
   const phone = String(req.body?.phone || '').trim()
   assertPhone(phone)
-  // 双重限流：IP 维度防止换号刷量，手机号维度防止针对某一号码轰炸（内网/本机豁免）
-  const smsIp = normalizeIp(clientIp(req))
-  if (!isPrivateIp(smsIp)) {
-    enforceRateLimit(`sms:ip:${smsIp}`, PHONE_SEND_IP_LIMIT, '验证码发送')
-    enforceRateLimit(`sms:phone:${phone}`, PHONE_SEND_PHONE_LIMIT, '该手机号的验证码发送')
-  }
+  // 双重限流，均不依赖来源 IP：
+  //   ① 全局总量——防「换号刷量」，本服务不被当作短信网关的唯一保证；
+  //   ② 手机号——防「针对某一号码轰炸」。
+  // 顺序先全局后号码：号码桶每号每天只有 2 次，若先判号码，被全局拒绝的请求会
+  // 白白吃掉用户当天的额度；全局桶留有 10 倍余量，被号码桶拒绝的重复点击多花
+  // 几个额度无碍。
+  enforceRateLimit('sms:global', PHONE_SEND_GLOBAL_LIMIT, '验证码发送')
+  enforceRateLimit(`sms:phone:${phone}`, PHONE_SEND_PHONE_LIMIT, '该手机号的验证码发送')
   // 手机号登录流程整段用同一套预生成设备标识（发送验证码 + 登录），成功后归该账号。
   // 注意：同一手机号若中途刷新页面重新发送验证码，会换一套新设备——酷狗侧表现为
   // 设备切换，属可接受行为（同一手机号本来就可能多设备）。
@@ -1365,7 +1320,6 @@ app.post('/api/checkin/run', wrap(async (req, res) => {
     throw err
   }
 
-  const ip = clientIp(req)
   const rawUserid = req.body?.userid != null ? String(req.body.userid).trim() : ''
 
   // ── 模式一：指定 userid，只签该账号 ──
@@ -1377,7 +1331,8 @@ app.post('/api/checkin/run', wrap(async (req, res) => {
       throw err
     }
 
-    // ① 每 userid 每天 N 次（不分 IP，全局计数）
+    // 每 userid 每天 N 次（不分 IP，全局计数）。这是本接口唯一的限流维度：
+    // 按来源 IP 计数在端口映射与反向代理两种部署下都不可靠，已移除。
     if (CHECKIN_PER_USERID_DAILY > 0) {
       const q = perUseridQuota(rawUserid)
       if (q.remaining <= 0) {
@@ -1390,23 +1345,8 @@ app.post('/api/checkin/run', wrap(async (req, res) => {
       }
     }
 
-    // ② 公网来源仍受 IP 冷却约束，防止单人反复刷不同账号
-    if (!isPrivateIp(ip) && CHECKIN_MANUAL_COOLDOWN_MS > 0) {
-      const cd = manualCheckinCooldown(ip)
-      if (cd.blocked) {
-        const err = new Error(
-          `该 IP 已触发过签到，需等待 ${formatRemaining(cd.remainingMs)} 后才能再次手动触发`
-        )
-        err.status = 429
-        err.code = 'manual-checkin-cooldown'
-        err.retryAfterMs = cd.remainingMs
-        throw err
-      }
-    }
-
     startCheckin('manual', { onlyUserid: rawUserid })
     if (CHECKIN_PER_USERID_DAILY > 0) markPerUseridUsed(rawUserid)
-    if (!isPrivateIp(ip)) markManualCheckin(ip)
     const q = perUseridQuota(rawUserid)
     return res.status(202).json({ ok: true, mode: 'single', userid: maskIdentifier(rawUserid), remaining: q.remaining })
   }
@@ -1421,22 +1361,9 @@ app.post('/api/checkin/run', wrap(async (req, res) => {
     throw err
   }
 
-  // admin 全量签到不占单账号配额；仍受 IP 冷却约束，避免被反复触发拖垮接口
-  if (!isPrivateIp(ip) && CHECKIN_MANUAL_COOLDOWN_MS > 0) {
-    const cd = manualCheckinCooldown(ip)
-    if (cd.blocked) {
-      const err = new Error(
-        `该 IP 已触发过签到，需等待 ${formatRemaining(cd.remainingMs)} 后才能再次手动触发`
-      )
-      err.status = 429
-      err.code = 'manual-checkin-cooldown'
-      err.retryAfterMs = cd.remainingMs
-      throw err
-    }
-  }
-
+  // admin 全量签到不占单账号配额；认证本身即门槛——失败计入 failsByIp 防爆破，
+  // 不再叠加按 IP 的冷却（同上，IP 维度在两种部署下都不可靠）。
   startCheckin('manual')
-  if (!isPrivateIp(ip)) markManualCheckin(ip)
   res.status(202).json({ ok: true, mode: 'all' })
 }))
 
@@ -1744,12 +1671,10 @@ app.post('/api/accounts/email/code', wrap(async (req, res) => {
 
   const targetUserid = resolveEmailTarget(req)
 
-  // 双重限流：IP 防刷量，账号防「针对某人反复发信」（内网/本机豁免）
-  const ip = normalizeIp(clientIp(req))
-  if (!isPrivateIp(ip)) {
-    enforceRateLimit(`mail:ip:${ip}`, EMAIL_SEND_IP_LIMIT, '邮箱验证码发送')
-    enforceRateLimit(`mail:user:${targetUserid}`, EMAIL_SEND_USER_LIMIT, '该账号的邮箱验证码发送')
-  }
+  // 限流只按目标账号：targetUserid 已由 accountsGuard 认证为本人（或 admin 指定），
+  // 调用方身份明确，用于防「针对某人反复发信」的正是账号维度；IP 维度在端口映射
+  // 与反向代理部署下不可靠，已移除。
+  enforceRateLimit(`mail:user:${targetUserid}`, EMAIL_SEND_USER_LIMIT, '该账号的邮箱验证码发送')
 
   const code = genEmailCode()
   const account = readUserinfo().find(u => String(u.userid) === targetUserid)
@@ -1927,16 +1852,17 @@ app.listen(WEBUI_PORT, () => {
   if (WEBUI_TRUST_PROXY !== false) {
     printYellow(`  反向代理: 已信任 X-Forwarded-For（WEBUI_TRUST_PROXY=${WEBUI_TRUST_PROXY_RAW}）`)
   } else {
-    // 未信任代理头时，公网请求会被视为来自代理内网地址，所有按 IP 的限制（含账号防爆破）都会被豁免
+    // 未信任代理头时，req.ip 恒为代理/网桥地址：账号防爆破的 IP 桶会把所有外网用户
+    // 挤进同一个桶（互相拖累），二维码限流则因来源是内网地址被整体豁免。
     const raw = String(WEBUI_TRUST_PROXY_RAW ?? '').trim()
     if (raw) {
       printYellow(`  反向代理: 已明确关闭（WEBUI_TRUST_PROXY=${raw}），不信任 X-Forwarded-For`)
     } else {
-      printRed('  ⚠ 未设置 WEBUI_TRUST_PROXY：经反向代理的公网请求会全部被视为内网来源，')
-      printRed('    按 IP 的限流与账号防爆破计数将被豁免；公网部署请设为 1。')
+      printRed('  ⚠ 未设置 WEBUI_TRUST_PROXY：经反向代理的公网请求会被视为同一个内网来源，')
+      printRed('    账号防爆破的 IP 桶会互相拖累、二维码限流会被豁免；公网部署请设为 1。')
     }
   }
-  printYellow(`  验证码限流: IP ${describeRateLimit(PHONE_SEND_IP_LIMIT)} · 手机号 ${describeRateLimit(PHONE_SEND_PHONE_LIMIT)}（内网/本机豁免）`)
+  printYellow(`  验证码限流: 全局 ${describeRateLimit(PHONE_SEND_GLOBAL_LIMIT)} · 手机号 ${describeRateLimit(PHONE_SEND_PHONE_LIMIT)}（不依赖来源 IP）`)
   printYellow(`  二维码限流: IP ${describeRateLimit(QR_GEN_IP_LIMIT)}（内网/本机豁免）`)
   if (mailConfigReady()) {
     const bound = readUserinfo().filter(u => u && u.email && u.emailVerified === true).length
@@ -1951,10 +1877,10 @@ app.listen(WEBUI_PORT, () => {
     printRed('  ⚠ 设备 MID: 未配置（每次启动随机生成，酷狗可能返回 status=0 / error_code=20006，')
     printRed('    验证码短信也可能被风控静默丢弃）；请在 .env 中设置 KUGOU_API_GUID 或 KUGOU_API_MID。')
   }
-  if (CHECKIN_MANUAL_COOLDOWN_MS > 0) {
-    printYellow(`  手动签到限流: 同一 IP 每 ${CHECKIN_MANUAL_COOLDOWN_HOURS} 小时仅可触发一次（内网/本机豁免）`)
+  if (CHECKIN_PER_USERID_DAILY > 0) {
+    printYellow(`  手动签到配额: 每账号每天 ${CHECKIN_PER_USERID_DAILY} 次（按北京时间跨天重置）`)
   } else {
-    printYellow('  手动签到限流: 已关闭（CHECKIN_MANUAL_COOLDOWN_HOURS=0）')
+    printYellow('  手动签到配额: 已关闭（CHECKIN_PER_USERID_DAILY=0）')
   }
 
   if (cron.validate(SCHEDULE)) {

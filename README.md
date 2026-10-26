@@ -93,8 +93,8 @@ docker inspect --format '{{.State.Health.Status}}' kgcheckin
 
 > - 公网暴露时，请在 `.env` 中设置 `WEBUI_PASSWORD`（全局访问密码）与 `ACCOUNTS_PASSWORD`（账号管理 admin 管理员密码），参考 `.env.example`
 > - ⚠ **关于默认密码**：酷狗ID 并非秘密（账号列表接口会返回，用户之间也会互相告知），因此知道某个 ID 的人可以登录该账号并改掉密码。该默认值为「方便用户首次改密」而保留；公网部署请设置 `WEBUI_PASSWORD`，或设 `ACCOUNTS_DISABLE_ID_DEFAULT=true` 改用「由 admin 分发密码」的方式
-> - 部署在反向代理之后时**必须**设置 `WEBUI_TRUST_PROXY`，否则所有请求会被视为来自代理内网地址，按 IP 的限流（验证码发送、二维码生成、手动签到冷却）与账号防爆破计数将**全部被豁免**；未设置时系统不会信任 `X-Forwarded-For`，以防伪造 IP 绕过计数。启动横幅会在未设置时红字提醒
-> - 发送短信验证码与生成登录二维码的接口均可匿名调用，已内置按 IP / 手机号的滑动窗口限流（可用 `WEBUI_PHONE_SEND_IP_LIMIT`、`WEBUI_PHONE_SEND_PHONE_LIMIT`、`WEBUI_QR_GEN_IP_LIMIT` 调整），防止本服务被当作短信轰炸机使用
+> - 部署在反向代理之后时**必须**设置 `WEBUI_TRUST_PROXY`，否则所有外部请求会被视为同一个代理内网地址——账号防爆破的 IP 桶会互相拖累（一人被锁波及所有人）、二维码限流会被整体豁免；未设置时系统不会信任 `X-Forwarded-For`，以防伪造 IP 绕过计数。启动横幅会在未设置时红字提醒
+> - 发送短信验证码与生成登录二维码的接口均可匿名调用，已内置滑动窗口限流（可用 `WEBUI_PHONE_SEND_GLOBAL_LIMIT`、`WEBUI_PHONE_SEND_PHONE_LIMIT`、`WEBUI_QR_GEN_IP_LIMIT` 调整），防止本服务被当作短信轰炸机使用。其中短信验证码按「全局 + 手机号」计数，不依赖来源 IP——容器端口映射下 `req.ip` 恒为网桥地址、反向代理下又来自可伪造的 `X-Forwarded-For`，按 IP 计数在生产部署里并不可靠
 > - 通知渠道密钥同样建议写在 `.env`（自动注入容器，不会被提交到仓库）
 
 ### 4. 命令行登录（可选）
@@ -148,10 +148,10 @@ docker compose run --rm kgcheckin node scheduler.js once   # 或命令行方式�
 | `ACCOUNTS_MAX_ATTEMPTS` / `ACCOUNTS_LOCK_MINUTES` | `3` / `5` | 可选覆盖防爆破策略（单账号最大错误次数 / 锁定时长） |
 | `ACCOUNTS_IP_MAX_ATTEMPTS` | `ACCOUNTS_MAX_ATTEMPTS × 5` | 单个 IP 的最大错误次数（放宽以免同 NAT 用户互相影响） |
 | `ACCOUNTS_DISABLE_ID_DEFAULT` | `false` | 设为 `true` 关闭「默认密码=酷狗ID」，未设密码的账号须由 admin 先设置密码（公网部署推荐） |
-| `WEBUI_TRUST_PROXY` | - | 部署在反向代理后（Nginx/Caddy/Cloudflare Tunnel 等）时**必须**设为 `1`，以信任 `X-Forwarded-For` 取真实 IP（也可填代理跳数，如 `2`）；未设置或设为 `0`/`false` 则不信任（防伪造绕过防爆破），但公网请求会全部被视为内网来源而豁免所有按 IP 的限流 |
-| `WEBUI_PHONE_SEND_IP_LIMIT` | `3/60` | 发送短信验证码的 IP 限流（"次数/分钟"，即每 IP 每小时 3 次）；设为 `0/1` 关闭 |
+| `WEBUI_TRUST_PROXY` | - | 部署在反向代理后（Nginx/Caddy/Cloudflare Tunnel 等）时**必须**设为 `1`，以信任 `X-Forwarded-For` 取真实 IP（也可填代理跳数，如 `2`）；未设置或设为 `0`/`false` 则不信任（防伪造绕过防爆破），但外部请求会被视为同一个代理内网地址，账号防爆破的 IP 桶会互相拖累、二维码限流会被豁免 |
+| `WEBUI_PHONE_SEND_GLOBAL_LIMIT` | `20/60` | 发送短信验证码的全局限流（"次数/分钟"，即全服务每小时 20 次），防换号刷量；不依赖来源 IP；设为 `0/1` 关闭 |
 | `WEBUI_PHONE_SEND_PHONE_LIMIT` | `2/1440` | 发送短信验证码的手机号限流（每号 24 小时 2 次），防止本服务被当作短信轰炸机 |
-| `WEBUI_QR_GEN_IP_LIMIT` | `1/3` | 生成登录二维码的 IP 限流（每 IP 3 分钟 1 次，每次都会向酷狗申请新 key） |
+| `WEBUI_QR_GEN_IP_LIMIT` | `1/3` | 生成登录二维码的 IP 限流（每 IP 3 分钟 1 次，每次都会向酷狗申请新 key）；内网/本机豁免 |
 | `CRON_SCHEDULE` | `10 1 * * *` | 签到计划任务（cron 表达式），默认每天北京时间 01:10 |
 | `CRON_TIMEZONE` | `Asia/Shanghai` | 调度器使用的时区 |
 | `RUN_ON_STARTUP` | `false` | 设为 `true` 时容器启动后立即执行一次签到 |
@@ -268,8 +268,7 @@ docker compose pull && docker compose up -d --build         # 拉取新代码后
 | `MAIL_FROM_NAME` | `酷狗签到助手` | 发件人显示名（From 头里的名称部分） |
 | `MAIL_INVALID_NOTIFY` | 开启 | 设为 `false` / `0` 关闭按账号的失效邮件 |
 | `MAIL_NOTICE_COOLDOWN_DAYS` | `7` | 同一账号的提醒冷却天数（最小 1） |
-| `WEBUI_EMAIL_SEND_IP_LIMIT` | `5/60` | 验证码发送限流：每 IP 每小时次数（内网/本机豁免） |
-| `WEBUI_EMAIL_SEND_USER_LIMIT` | `3/60` | 验证码发送限流：每账号每小时次数 |
+| `WEBUI_EMAIL_SEND_USER_LIMIT` | `3/60` | 验证码发送限流：每账号每小时次数（按账号计数，不依赖来源 IP） |
 | `WEBUI_PUBLIC_URL` | 空 | WebUI 公网地址，会附加在失效邮件正文里方便点开重新登录 |
 
 说明与限制：
